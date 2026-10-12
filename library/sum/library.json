@@ -1,7 +1,7 @@
 {
-  "name": "Fibonacci",
-  "description": "Fibonacci function.",
+  "name": "Sum",
+  "description": "Sum function.",
   "version": "1.0.0",
   "author": "Delfin Ibn Kadafi",
-  "files": ["fib.ell"]
+  "files": ["sum.ell"]
 }

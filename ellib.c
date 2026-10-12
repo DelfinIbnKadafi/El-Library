@@ -102,6 +102,29 @@ static int make_directory(const char *path)
     return _mkdir(path) == 0 || is_directory(path);
 }
 
+static int create_temp_directory(char *out, size_t capacity)
+{
+    char temp_path[MAX_PATH_LEN];
+    char candidate[MAX_PATH_LEN];
+    DWORD length = GetTempPathA(sizeof(temp_path), temp_path);
+
+    if (!length || length >= sizeof(temp_path) ||
+        !GetTempFileNameA(temp_path, "ell", 0, candidate))
+        return 0;
+
+    if (strlen(candidate) >= capacity) {
+        DeleteFileA(candidate);
+        return 0;
+    }
+
+    if (!DeleteFileA(candidate) ||
+        (!CreateDirectoryA(candidate, NULL) && !is_directory(candidate)))
+        return 0;
+
+    strcpy(out, candidate);
+    return 1;
+}
+
 static int make_parent_directories(const char *path)
 {
     char temp[MAX_PATH_LEN];
@@ -550,12 +573,13 @@ static int install_github(const char *repo,
     char work[MAX_PATH_LEN], zip[MAX_PATH_LEN];
     char source[MAX_PATH_LEN];
 
-    if (!path_join(work, sizeof(work), exe_dir, "ellib-tmp") ||
-        !path_join(zip, sizeof(zip), work, "repo.zip"))
-        return 0;
-
-    if (!make_directory(work)) {
+    if (!create_temp_directory(work, sizeof(work))) {
         printf("Error: cannot create temporary directory.\n");
+        return 0;
+    }
+
+    if (!path_join(zip, sizeof(zip), work, "repo.zip")) {
+        remove_directory(work);
         return 0;
     }
 
