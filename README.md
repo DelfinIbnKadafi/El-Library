@@ -5,6 +5,7 @@ El Libary (Ellib) is a package/libary manager for El Language.
 ## Install Library
 
 Install from official repository. The official repository is https://github.com/DelfinIbnKadafi/El-Library
+Official packages must be placed at `library/<library_name>/library.json`.
 
 ```bash
 ellib install lib_name

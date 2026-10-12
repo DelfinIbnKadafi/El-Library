@@ -1,0 +1,2 @@
+function sum(var int num1, var int num2) =
+  return num1 + num2;

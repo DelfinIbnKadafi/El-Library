@@ -1,0 +1,7 @@
+{
+  "name": "Fibonacci",
+  "description": "Fibonacci function.",
+  "version": "1.0.0",
+  "author": "Delfin Ibn Kadafi",
+  "files": ["fib.ell"]
+}
