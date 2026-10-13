@@ -1,17 +1,55 @@
+/*
+ * ellib - El Language library manager.
+ *
+ * Works on Windows and on Linux/macOS. Everything that depends on the
+ * operating system lives in the "platform layer" (first half of this file),
+ * the rest of the file is the same for every system.
+ */
 
+#ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
+#else
+/* Needed for mkdtemp(), readlink() and lstat() while compiling with -std=c99 */
+#define _XOPEN_SOURCE 700
+#endif
 
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <ctype.h>
-#include <direct.h>
+#include <errno.h>
 
-#define APP_VERSION "1.0.0"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#endif
+
+#define APP_VERSION "1.2.0"
 #define MAX_FILES 128
 #define MAX_PATH_LEN 4096
 #define MAX_JSON_SIZE (1024 * 1024)
+
+#ifdef _WIN32
+#define PATH_SEP '\\'
+/* Windows has zip support built in (PowerShell), Linux always has tar */
+#define ARCHIVE_KIND "zip"
+#define ARCHIVE_NAME "repo.zip"
+#define names_equal(a, b) (_stricmp((a), (b)) == 0)
+#else
+#define PATH_SEP '/'
+#define ARCHIVE_KIND "tar.gz"
+#define ARCHIVE_NAME "repo.tar.gz"
+#define names_equal(a, b) (strcmp((a), (b)) == 0)
+#endif
 
 typedef struct {
     char name[128];
@@ -22,24 +60,613 @@ typedef struct {
 static char exe_dir[MAX_PATH_LEN];
 static char library_dir[MAX_PATH_LEN];
 
+/* ------------------------------------------------------------------ */
+/* Platform layer                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Last operating system error. It is saved right after a call fails, so
+   that other calls made afterwards cannot overwrite it. */
+static char os_error_text[256];
+static int os_error_permission;
+
+static void save_errno(int code)
+{
+    snprintf(os_error_text, sizeof(os_error_text), "%s", strerror(code));
+
+    os_error_permission = code == EACCES || code == EPERM;
+
+#ifndef _WIN32
+    if (code == EROFS)
+        os_error_permission = 1;
+#endif
+}
+
+#ifdef _WIN32
+static void save_win_error(DWORD code)
+{
+    DWORD n = FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, code, 0, os_error_text, sizeof(os_error_text), NULL);
+
+    /* Windows messages end with ".\r\n" */
+    while (n > 0 && (os_error_text[n - 1] == '\r' ||
+                     os_error_text[n - 1] == '\n' ||
+                     os_error_text[n - 1] == ' '))
+        os_error_text[--n] = '\0';
+
+    if (n == 0)
+        snprintf(os_error_text, sizeof(os_error_text), "unknown error");
+
+    size_t used = strlen(os_error_text);
+
+    snprintf(os_error_text + used, sizeof(os_error_text) - used,
+             " (error %lu)", (unsigned long)code);
+
+    os_error_permission = code == ERROR_ACCESS_DENIED ||
+                          code == ERROR_WRITE_PROTECT;
+}
+#endif
+
+/* Print the reason of the last saved error, and what to do about it when
+   the reason is a missing permission. */
+static void print_os_error(void)
+{
+    if (!os_error_text[0])
+        return;
+
+    printf("       Reason: %s\n", os_error_text);
+
+    if (!os_error_permission)
+        return;
+
+#ifdef _WIN32
+    puts("Hint: your user account is not allowed to change the library folder.");
+    puts("      Run ellib from an Administrator terminal, or reinstall ELVM");
+    puts("      with the latest installer, which makes that folder writable.");
+#else
+    puts("Hint: your user is not allowed to change the library folder.");
+    puts("      Run ellib with sudo, or install ELVM in a folder you own.");
+#endif
+}
+
+static int is_separator(char c)
+{
+    return c == '/' || c == '\\';
+}
+
 static int path_join(char *out, size_t size,
                      const char *a, const char *b)
 {
-    int n = snprintf(out, size, "%s\\%s", a, b);
+    size_t len = strlen(a);
+    int n;
+
+    if (len > 0 && is_separator(a[len - 1]))
+        n = snprintf(out, size, "%s%s", a, b);
+    else
+        n = snprintf(out, size, "%s%c%s", a, PATH_SEP, b);
+
     return n >= 0 && (size_t)n < size;
 }
 
 static int is_directory(const char *path)
 {
+#ifdef _WIN32
     DWORD attr = GetFileAttributesA(path);
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
+
+static int path_exists(const char *path)
+{
+#ifdef _WIN32
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return stat(path, &st) == 0;
+#endif
+}
+
+/* Create one directory. It is fine if the directory already exists. */
+static int make_directory(const char *path)
+{
+    if (is_directory(path))
+        return 1;
+
+#ifdef _WIN32
+    if (CreateDirectoryA(path, NULL))
+        return 1;
+
+    DWORD code = GetLastError();
+
+    if (code == ERROR_ALREADY_EXISTS && is_directory(path))
+        return 1;
+
+    save_win_error(code);
+    return 0;
+#else
+    if (mkdir(path, 0755) == 0)
+        return 1;
+
+    int code = errno;
+
+    if (code == EEXIST && is_directory(path))
+        return 1;
+
+    save_errno(code);
+    return 0;
+#endif
+}
+
+#ifdef _WIN32
+/* PowerShell strings written between '...' only need ' to be doubled */
+static int powershell_quote(const char *in, char *out, size_t capacity)
+{
+    size_t i = 0;
+
+    for (; *in; in++) {
+        size_t needed = *in == '\'' ? 2 : 1;
+
+        if (i + needed >= capacity)
+            return 0;
+
+        out[i++] = *in;
+
+        if (*in == '\'')
+            out[i++] = '\'';
+    }
+
+    out[i] = '\0';
+    return 1;
+}
+
+/* Append one argument to a command line, between double quotes */
+static int append_quoted(char *cmd, size_t size, size_t *len,
+                         const char *arg)
+{
+    size_t n = strlen(arg);
+    size_t trailing = 0;
+
+    /* A double quote cannot be written safely inside an argument. None of
+       the arguments used by ellib can contain one. */
+    if (strchr(arg, '"'))
+        return 0;
+
+    /* Backslashes right before the closing quote must be doubled */
+    while (trailing < n && arg[n - 1 - trailing] == '\\')
+        trailing++;
+
+    if (*len + n + trailing + 3 >= size)
+        return 0;
+
+    cmd[(*len)++] = '"';
+    memcpy(cmd + *len, arg, n);
+    *len += n;
+
+    for (size_t i = 0; i < trailing; i++)
+        cmd[(*len)++] = '\\';
+
+    cmd[(*len)++] = '"';
+    cmd[*len] = '\0';
+
+    return 1;
+}
+#endif
+
+/* Run a program and wait for it. 'argv' ends with NULL, 'cwd' may be NULL.
+   Returns the exit code of the program, or -1 if it could not be started.
+   No shell is involved, so no argument can be taken as a command. */
+static int run_process(const char *cwd, char *const argv[])
+{
+#ifdef _WIN32
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char cmd[MAX_PATH_LEN * 3];
+    size_t len = 0;
+
+    cmd[0] = '\0';
+
+    for (int i = 0; argv[i]; i++) {
+        if (i > 0) {
+            if (len + 1 >= sizeof(cmd))
+                return -1;
+
+            cmd[len++] = ' ';
+            cmd[len] = '\0';
+        }
+
+        if (!append_quoted(cmd, sizeof(cmd), &len, argv[i]))
+            return -1;
+    }
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+
+    if (!CreateProcessA(
+        NULL, cmd, NULL, NULL, FALSE,
+        CREATE_NO_WINDOW, NULL, cwd, &si, &pi))
+        return -1;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    return (int)exit_code;
+#else
+    int status;
+    pid_t pid;
+
+    fflush(stdout);
+
+    pid = fork();
+
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        if (cwd && chdir(cwd) != 0)
+            _exit(126);
+
+        execvp(argv[0], argv);
+
+        /* The program was not found */
+        _exit(127);
+    }
+
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+/* Find the folder of the ellib executable. The libraries are stored in a
+   folder named "library" next to it, the same place elvm looks in. */
+static int init_paths(const char *argv0)
+{
+    char exe[MAX_PATH_LEN];
+
+    exe[0] = '\0';
+
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
+
+    if (!n || n >= sizeof(exe))
+        exe[0] = '\0';
+
+    (void)argv0;
+#elif defined(__APPLE__)
+    uint32_t size = sizeof(exe);
+
+    if (_NSGetExecutablePath(exe, &size) != 0)
+        exe[0] = '\0';
+
+    (void)argv0;
+#else
+    ssize_t n = -1;
+
+#ifdef __linux__
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+#endif
+
+    if (n > 0) {
+        exe[n] = '\0';
+    } else if (argv0 && strchr(argv0, '/') &&
+               strlen(argv0) < sizeof(exe)) {
+        /* Other systems: argv[0] is only usable when it contains a path */
+        strcpy(exe, argv0);
+    }
+#endif
+
+    if (!exe[0] || strlen(exe) >= sizeof(exe_dir))
+        return 0;
+
+    strcpy(exe_dir, exe);
+
+    char *slash = NULL;
+
+    for (char *p = exe_dir; *p; p++) {
+        if (is_separator(*p))
+            slash = p;
+    }
+
+    if (!slash)
+        return 0;
+
+    /* A file directly in the root folder keeps the root as its folder */
+    if (slash == exe_dir)
+        slash++;
+
+    *slash = '\0';
+
+    return path_join(
+        library_dir, sizeof(library_dir),
+        exe_dir, "library");
+}
+
+#ifndef _WIN32
+/* Delete a file, a link, or a folder with everything inside it. Links are
+   removed, never followed. */
+static int remove_tree(const char *path)
+{
+    struct stat st;
+
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT)
+            return 1;
+
+        save_errno(errno);
+        return 0;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) == 0)
+            return 1;
+
+        save_errno(errno);
+        return 0;
+    }
+
+    /* A folder without write permission cannot have its content deleted */
+    chmod(path, st.st_mode | S_IRWXU);
+
+    DIR *dir = opendir(path);
+
+    if (!dir) {
+        save_errno(errno);
+        return 0;
+    }
+
+    int ok = 1;
+    struct dirent *entry;
+
+    while (ok && (entry = readdir(dir)) != NULL) {
+        char child[MAX_PATH_LEN];
+
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+
+        if (!path_join(child, sizeof(child), path, entry->d_name))
+            ok = 0;
+        else
+            ok = remove_tree(child);
+    }
+
+    closedir(dir);
+
+    if (!ok)
+        return 0;
+
+    if (rmdir(path) != 0) {
+        save_errno(errno);
+        return 0;
+    }
+
+    return 1;
+}
+#endif
+
+/* Delete a folder with everything inside it */
+static int remove_directory(const char *path)
+{
+#ifdef _WIN32
+    /* PowerShell is used only with a path constructed from a validated
+       package name and the known library directory. */
+    char quoted[MAX_PATH_LEN * 2];
+    char script[MAX_PATH_LEN * 2 + 128];
+
+    os_error_text[0] = '\0';
+
+    if (!powershell_quote(path, quoted, sizeof(quoted)) ||
+        snprintf(script, sizeof(script),
+                 "Remove-Item -LiteralPath '%s' "
+                 "-Recurse -Force -ErrorAction Stop",
+                 quoted) >= (int)sizeof(script))
+        return 0;
+
+    char *argv[] = { "powershell.exe", "-NoProfile", "-Command",
+                     script, NULL };
+
+    return run_process(NULL, argv) == 0;
+#else
+    return remove_tree(path);
+#endif
+}
+
+/* Create a new, empty folder for temporary files */
+static int create_temp_directory(char *out, size_t capacity)
+{
+#ifdef _WIN32
+    char temp_path[MAX_PATH_LEN];
+    char candidate[MAX_PATH_LEN];
+    DWORD length = GetTempPathA(sizeof(temp_path), temp_path);
+
+    if (!length || length >= sizeof(temp_path) ||
+        !GetTempFileNameA(temp_path, "ell", 0, candidate))
+        return 0;
+
+    if (strlen(candidate) >= capacity) {
+        DeleteFileA(candidate);
+        return 0;
+    }
+
+    if (!DeleteFileA(candidate) ||
+        (!CreateDirectoryA(candidate, NULL) && !is_directory(candidate)))
+        return 0;
+
+    strcpy(out, candidate);
+    return 1;
+#else
+    const char *temp = getenv("TMPDIR");
+
+    if (!temp || !*temp)
+        temp = "/tmp";
+
+    if (snprintf(out, capacity, "%s/ellibXXXXXX", temp) >= (int)capacity)
+        return 0;
+
+    if (!mkdtemp(out)) {
+        save_errno(errno);
+        return 0;
+    }
+
+    return 1;
+#endif
+}
+
+/* Call 'callback' for every folder directly inside 'dir', until a call
+   returns non-zero. Returns 1 if the search was stopped that way. */
+static int for_each_subdirectory(
+    const char *dir,
+    int (*callback)(const char *path, void *context),
+    void *context)
+{
+    char path[MAX_PATH_LEN];
+    int stop = 0;
+
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    char pattern[MAX_PATH_LEN + 2];
+
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", dir) >=
+        (int)sizeof(pattern))
+        return 0;
+
+    HANDLE h = FindFirstFileA(pattern, &fd);
+
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            strcmp(fd.cFileName, ".") &&
+            strcmp(fd.cFileName, "..") &&
+            path_join(path, sizeof(path), dir, fd.cFileName) &&
+            callback(path, context)) {
+            stop = 1;
+            break;
+        }
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    struct dirent *entry;
+
+    if (!d)
+        return 0;
+
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") &&
+            strcmp(entry->d_name, "..") &&
+            path_join(path, sizeof(path), dir, entry->d_name) &&
+            is_directory(path) &&
+            callback(path, context)) {
+            stop = 1;
+            break;
+        }
+    }
+
+    closedir(d);
+#endif
+
+    return stop;
+}
+
+static int download_repo(const char *repo,
+                         const char *branch,
+                         const char *archive_path)
+{
+    char url[1024];
+
+    const char *slash = strchr(repo, '/');
+    char owner[128], name[128];
+
+    size_t owner_len = (size_t)(slash - repo);
+    memcpy(owner, repo, owner_len);
+    owner[owner_len] = '\0';
+    strcpy(name, slash + 1);
+
+    if (snprintf(url, sizeof(url),
+        "https://codeload.github.com/%s/%s/" ARCHIVE_KIND "/refs/heads/%s",
+        owner, name, branch) >= (int)sizeof(url))
+        return 0;
+
+#ifdef _WIN32
+    char *curl[] = { "curl.exe", "-fLsS", "--retry", "2",
+                     "-o", (char *)archive_path, url, NULL };
+
+    return run_process(NULL, curl) == 0;
+#else
+    char *curl[] = { "curl", "-fLsS", "--retry", "2",
+                     "-o", (char *)archive_path, url, NULL };
+
+    int code = run_process(NULL, curl);
+
+    /* curl is not installed, try wget */
+    if (code == 127 || code == -1) {
+        char *wget[] = { "wget", "-q", "-O", (char *)archive_path,
+                         url, NULL };
+
+        code = run_process(NULL, wget);
+    }
+
+    if (code != 0)
+        remove(archive_path);
+
+    return code == 0;
+#endif
+}
+
+/* Unpack the archive that was downloaded to 'work' (see ARCHIVE_NAME) into
+   the same folder 'work'. */
+static int extract_archive(const char *work)
+{
+#ifdef _WIN32
+    char archive[MAX_PATH_LEN];
+    char quoted_archive[MAX_PATH_LEN * 2];
+    char quoted_work[MAX_PATH_LEN * 2];
+    char script[MAX_PATH_LEN * 4 + 128];
+
+    if (!path_join(archive, sizeof(archive), work, ARCHIVE_NAME) ||
+        !powershell_quote(archive, quoted_archive, sizeof(quoted_archive)) ||
+        !powershell_quote(work, quoted_work, sizeof(quoted_work)) ||
+        snprintf(script, sizeof(script),
+                 "Expand-Archive -LiteralPath '%s' "
+                 "-DestinationPath '%s' -Force",
+                 quoted_archive, quoted_work) >= (int)sizeof(script))
+        return 0;
+
+    char *argv[] = { "powershell.exe", "-NoProfile", "-Command",
+                     script, NULL };
+
+    return run_process(NULL, argv) == 0;
+#else
+    /* Running inside 'work' with a plain file name keeps tar away from any
+       special characters in the path of the temporary folder. */
+    char *argv[] = { "tar", "-xzf", ARCHIVE_NAME, NULL };
+
+    return run_process(work, argv) == 0;
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared code                                                         */
+/* ------------------------------------------------------------------ */
 
 static int valid_name(const char *name)
 {
-    if (!name || !*name ||
-        !strcmp(name, ".") || !strcmp(name, ".."))
+    if (!name || !*name || name[0] == '.')
         return 0;
 
     for (const unsigned char *p =
@@ -74,57 +701,46 @@ static int valid_repo(const char *repo)
     return valid_name(owner) && valid_name(name);
 }
 
-static int init_paths(void)
+/* Create the library folder if it is missing, and make sure this user can
+   really create and delete folders in it. This is checked before anything
+   is downloaded, so a missing permission is reported at once, and with the
+   real reason. */
+static int ensure_library_directory(void)
 {
-    DWORD n = GetModuleFileNameA(
-        NULL, exe_dir, sizeof(exe_dir));
+    char probe[MAX_PATH_LEN];
+    char name[64];
 
-    if (!n || n >= sizeof(exe_dir))
-        return 0;
+    os_error_text[0] = '\0';
 
-    char *slash = strrchr(exe_dir, '\\');
-
-    if (!slash)
-        return 0;
-
-    *slash = '\0';
-
-    return path_join(
-        library_dir, sizeof(library_dir),
-        exe_dir, "library");
-}
-
-static int make_directory(const char *path)
-{
-    if (is_directory(path))
-        return 1;
-
-    return _mkdir(path) == 0 || is_directory(path);
-}
-
-static int create_temp_directory(char *out, size_t capacity)
-{
-    char temp_path[MAX_PATH_LEN];
-    char candidate[MAX_PATH_LEN];
-    DWORD length = GetTempPathA(sizeof(temp_path), temp_path);
-
-    if (!length || length >= sizeof(temp_path) ||
-        !GetTempFileNameA(temp_path, "ell", 0, candidate))
-        return 0;
-
-    if (strlen(candidate) >= capacity) {
-        DeleteFileA(candidate);
+    if (!make_directory(library_dir)) {
+        printf("Error: cannot create the library folder:\n       %s\n",
+               library_dir);
+        print_os_error();
         return 0;
     }
 
-    if (!DeleteFileA(candidate) ||
-        (!CreateDirectoryA(candidate, NULL) && !is_directory(candidate)))
+#ifdef _WIN32
+    snprintf(name, sizeof(name), ".ellib-test-%lu",
+             (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(name, sizeof(name), ".ellib-test-%lu", (unsigned long)getpid());
+#endif
+
+    if (!path_join(probe, sizeof(probe), library_dir, name))
         return 0;
 
-    strcpy(out, candidate);
+    if (!make_directory(probe)) {
+        printf("Error: cannot write to the library folder:\n       %s\n",
+               library_dir);
+        print_os_error();
+        return 0;
+    }
+
+    remove_directory(probe);
     return 1;
 }
 
+/* Create every folder that leads to the file 'path' */
 static int make_parent_directories(const char *path)
 {
     char temp[MAX_PATH_LEN];
@@ -134,128 +750,65 @@ static int make_parent_directories(const char *path)
 
     strcpy(temp, path);
 
-    char *last = strrchr(temp, '\\');
+    for (char *p = temp + 1; *p; p++) {
+        if (!is_separator(*p))
+            continue;
 
-    if (last) {
-        *last = '\0';
+        char saved = *p;
+        *p = '\0';
 
-        for (char *p = temp + 3; *p; p++) {
-            if (*p == '\\') {
-                *p = '\0';
-                if (*temp && !is_directory(temp))
-                    _mkdir(temp);
-                *p = '\\';
-            }
-        }
+        /* "C:" is a drive, not a folder to create */
+        int is_drive = p - temp == 2 && temp[1] == ':';
 
-        if (*temp && !is_directory(temp))
-            _mkdir(temp);
+        if (!is_drive && !make_directory(temp))
+            return 0;
+
+        *p = saved;
     }
 
     return 1;
 }
 
-static int run_process(const char *command)
-{
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-
-    ZeroMemory(&si, sizeof(si));
-    ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
-
-    char cmd[MAX_PATH_LEN * 2];
-
-    if (strlen(command) >= sizeof(cmd))
-        return 0;
-
-    strcpy(cmd, command);
-
-    if (!CreateProcessA(
-        NULL, cmd, NULL, NULL, FALSE,
-        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-        return 0;
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-
-    DWORD exit_code = 1;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    return exit_code == 0;
-}
-
-static int download_repo(const char *repo,
-                         const char *branch,
-                         const char *zip_path)
-{
-    char url[1024];
-    char command[MAX_PATH_LEN * 2];
-
-    const char *slash = strchr(repo, '/');
-    char owner[128], name[128];
-
-    size_t owner_len = (size_t)(slash - repo);
-    memcpy(owner, repo, owner_len);
-    owner[owner_len] = '\0';
-    strcpy(name, slash + 1);
-
-    if (snprintf(url, sizeof(url),
-        "https://codeload.github.com/%s/%s/zip/refs/heads/%s",
-        owner, name, branch) >= (int)sizeof(url))
-        return 0;
-
-    if (snprintf(command, sizeof(command),
-        "curl.exe -fLsS --retry 2 -o \"%s\" \"%s\"",
-        zip_path, url) >= (int)sizeof(command))
-        return 0;
-
-    return run_process(command);
-}
-
-static int extract_zip(const char *zip,
-                       const char *destination)
-{
-    char command[MAX_PATH_LEN * 3];
-
-    if (snprintf(command, sizeof(command),
-        "powershell.exe -NoProfile -Command "
-        "\"Expand-Archive -LiteralPath '%s' "
-        "-DestinationPath '%s' -Force\"",
-        zip, destination) >= (int)sizeof(command))
-        return 0;
-
-    return run_process(command);
-}
-
-/* Read a JSON string value for a given key.
-   This is a limited parser, not a full JSON implementation. */
-static int json_string(const char *json, const char *key,
-                       char *out, size_t capacity)
+/* Find the text after "key": in a JSON text (spaces skipped), or NULL.
+   This is a limited reader, not a full JSON implementation. */
+static const char *json_value(const char *json, const char *key)
 {
     char pattern[160];
 
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
 
-    const char *p = strstr(json, pattern);
+    size_t len = strlen(pattern);
+    const char *p = json;
 
-    if (!p)
-        return 0;
+    while ((p = strstr(p, pattern)) != NULL) {
+        const char *q = p + len;
 
-    p += strlen(pattern);
+        while (isspace((unsigned char)*q))
+            q++;
 
-    while (isspace((unsigned char)*p))
-        p++;
+        /* The text may also be a value, only a key is followed by ':' */
+        if (*q == ':') {
+            q++;
 
-    if (*p++ != ':')
-        return 0;
+            while (isspace((unsigned char)*q))
+                q++;
 
-    while (isspace((unsigned char)*p))
-        p++;
+            return q;
+        }
 
-    if (*p++ != '"')
+        p += len;
+    }
+
+    return NULL;
+}
+
+/* Read a JSON string value for a given key. */
+static int json_string(const char *json, const char *key,
+                       char *out, size_t capacity)
+{
+    const char *p = json_value(json, key);
+
+    if (!p || *p++ != '"')
         return 0;
 
     size_t i = 0;
@@ -348,18 +901,13 @@ static int read_manifest(const char *path, Library *lib)
         return 0;
     }
 
-    const char *p = strstr(json, "\"files\"");
+    const char *p = json_value(json, "files");
 
-    if (!p || !(p = strchr(p, ':'))) {
+    if (!p) {
         printf("Error: missing files array.\n");
         free(json);
         return 0;
     }
-
-    p++;
-
-    while (isspace((unsigned char)*p))
-        p++;
 
     if (*p++ != '[') {
         printf("Error: files must be an array.\n");
@@ -422,6 +970,13 @@ static int read_manifest(const char *path, Library *lib)
             return 0;
         }
 
+        /* A library written on Windows may use '\' between folders, store
+           it with '/' so the file also has the right name on Linux */
+        for (char *c = out; *c; c++) {
+            if (*c == '\\')
+                *c = '/';
+        }
+
         lib->file_count++;
     }
 
@@ -439,14 +994,20 @@ static int copy_file(const char *source, const char *target)
 {
     FILE *in = fopen(source, "rb");
 
-    if (!in)
+    if (!in) {
+        save_errno(errno);
         return 0;
+    }
 
-    make_parent_directories(target);
+    if (!make_parent_directories(target)) {
+        fclose(in);
+        return 0;
+    }
 
     FILE *out = fopen(target, "wb");
 
     if (!out) {
+        save_errno(errno);
         fclose(in);
         return 0;
     }
@@ -457,16 +1018,23 @@ static int copy_file(const char *source, const char *target)
 
     while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
         if (fwrite(buffer, 1, n, out) != n) {
+            save_errno(errno);
             ok = 0;
             break;
         }
     }
 
-    if (ferror(in))
+    if (ferror(in) && ok) {
+        save_errno(errno);
         ok = 0;
+    }
 
     fclose(in);
-    fclose(out);
+
+    if (fclose(out) != 0 && ok) {
+        save_errno(errno);
+        ok = 0;
+    }
 
     return ok;
 }
@@ -478,6 +1046,8 @@ static int install_library(const char *source,
     char target[MAX_PATH_LEN];
     Library lib;
 
+    os_error_text[0] = '\0';
+
     if (!path_join(manifest, sizeof(manifest),
                    source, "library.json")) {
         return 0;
@@ -487,14 +1057,28 @@ static int install_library(const char *source,
         return 0;
 
     if (requested_name &&
-        _stricmp(requested_name, lib.name) != 0) {
+        !names_equal(requested_name, lib.name)) {
         printf("Error: requested '%s', manifest names '%s'.\n",
                requested_name, lib.name);
         return 0;
     }
 
+    /* Validate all declared files before creating or copying anything, so a
+       broken package never leaves a half installed folder behind. */
+    for (int i = 0; i < lib.file_count; i++) {
+        char src[MAX_PATH_LEN];
+
+        if (!path_join(src, sizeof(src), source, lib.files[i]) ||
+            !path_exists(src)) {
+            printf("Error: missing package file: %s\n",
+                   lib.files[i]);
+            return 0;
+        }
+    }
+
     if (!make_directory(library_dir)) {
         printf("Error: cannot create library directory.\n");
+        print_os_error();
         return 0;
     }
 
@@ -509,21 +1093,10 @@ static int install_library(const char *source,
     }
 
     if (!make_directory(target)) {
-        printf("Error: cannot create package directory.\n");
+        printf("Error: cannot create package directory:\n       %s\n",
+               target);
+        print_os_error();
         return 0;
-    }
-
-    /* Validate all declared files before copying any of them. */
-    for (int i = 0; i < lib.file_count; i++) {
-        char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
-
-        if (!path_join(src, sizeof(src), source, lib.files[i]) ||
-            !path_join(dst, sizeof(dst), target, lib.files[i]) ||
-            GetFileAttributesA(src) == INVALID_FILE_ATTRIBUTES) {
-            printf("Error: missing package file: %s\n",
-                   lib.files[i]);
-            return 0;
-        }
     }
 
     for (int i = 0; i < lib.file_count; i++) {
@@ -534,6 +1107,8 @@ static int install_library(const char *source,
 
         if (!copy_file(src, dst)) {
             printf("Error: failed copying %s\n", lib.files[i]);
+            print_os_error();
+            remove_directory(target);
             return 0;
         }
     }
@@ -544,6 +1119,8 @@ static int install_library(const char *source,
                    target, "library.json") ||
         !copy_file(manifest, dst_manifest)) {
         printf("Error: failed copying library.json.\n");
+        print_os_error();
+        remove_directory(target);
         return 0;
     }
 
@@ -551,102 +1128,88 @@ static int install_library(const char *source,
     return 1;
 }
 
-static int remove_directory(const char *path)
-{
-    /* PowerShell is used only with a path constructed from a
-       validated package name and the known library directory. */
-    char command[MAX_PATH_LEN * 2];
+/* Used while searching a downloaded repository for the package */
+typedef struct {
+    const char *package_name;
+    char source[MAX_PATH_LEN];
+} SourceSearch;
 
-    if (snprintf(command, sizeof(command),
-        "powershell.exe -NoProfile -Command "
-        "\"Remove-Item -LiteralPath '%s' "
-        "-Recurse -Force -ErrorAction Stop\"",
-        path) >= (int)sizeof(command))
+/* 'root' is the folder inside the unpacked archive (GitHub puts everything
+   in one folder named like "repository-main") */
+static int check_package_root(const char *root, void *context)
+{
+    SourceSearch *search = context;
+    char candidate[MAX_PATH_LEN];
+    char manifest[MAX_PATH_LEN];
+
+    if (search->package_name) {
+        char package_root[MAX_PATH_LEN];
+
+        if (!path_join(package_root, sizeof(package_root),
+                       root, "library") ||
+            !path_join(candidate, sizeof(candidate),
+                       package_root, search->package_name))
+            return 0;
+    } else {
+        if (strlen(root) >= sizeof(candidate))
+            return 0;
+
+        strcpy(candidate, root);
+    }
+
+    if (!path_join(manifest, sizeof(manifest),
+                   candidate, "library.json") ||
+        !path_exists(manifest))
         return 0;
 
-    return run_process(command);
+    strcpy(search->source, candidate);
+    return 1;
 }
 
 static int install_github(const char *repo,
                           const char *package_name)
 {
-    char work[MAX_PATH_LEN], zip[MAX_PATH_LEN];
-    char source[MAX_PATH_LEN];
+    char work[MAX_PATH_LEN], archive[MAX_PATH_LEN];
+
+    /* Fail early, before downloading, if the library folder is not usable */
+    if (!ensure_library_directory())
+        return 0;
 
     if (!create_temp_directory(work, sizeof(work))) {
         printf("Error: cannot create temporary directory.\n");
+        print_os_error();
         return 0;
     }
 
-    if (!path_join(zip, sizeof(zip), work, "repo.zip")) {
+    if (!path_join(archive, sizeof(archive), work, ARCHIVE_NAME)) {
         remove_directory(work);
         return 0;
     }
 
-    int downloaded = download_repo(repo, "main", zip);
+    int downloaded = download_repo(repo, "main", archive);
 
     if (!downloaded)
-        downloaded = download_repo(repo, "master", zip);
+        downloaded = download_repo(repo, "master", archive);
 
     if (!downloaded) {
         printf("Error: failed downloading GitHub repository.\n");
+        puts("       Check your internet connection, and that curl is installed.");
         remove_directory(work);
         return 0;
     }
 
-    if (!extract_zip(zip, work)) {
+    if (!extract_archive(work)) {
         printf("Error: failed extracting repository.\n");
         remove_directory(work);
         return 0;
     }
 
-    WIN32_FIND_DATAA fd;
-    char pattern[MAX_PATH_LEN + 2];
-    char package_root[MAX_PATH_LEN];
+    SourceSearch search;
 
-    snprintf(pattern, sizeof(pattern), "%s\\*", work);
+    search.package_name = package_name;
+    search.source[0] = '\0';
 
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    int found = 0;
-
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                strcmp(fd.cFileName, ".") &&
-                strcmp(fd.cFileName, "..")) {
-                if (path_join(source, sizeof(source),
-                              work, fd.cFileName)) {
-                    char manifest[MAX_PATH_LEN];
-
-                    int has_manifest = 0;
-
-                    if (package_name) {
-                        has_manifest =
-                            path_join(package_root, sizeof(package_root),
-                                      source, "library") &&
-                            path_join(source, sizeof(source),
-                                      package_root, package_name) &&
-                            path_join(manifest, sizeof(manifest),
-                                      source, "library.json") &&
-                            GetFileAttributesA(manifest) != INVALID_FILE_ATTRIBUTES;
-                    } else {
-                        has_manifest =
-                            path_join(manifest, sizeof(manifest),
-                                      source, "library.json") &&
-                            GetFileAttributesA(manifest) != INVALID_FILE_ATTRIBUTES;
-                    }
-
-                    if (has_manifest) {
-                        found = 1;
-                        break;
-                    }
-                }
-            }
-        } while (FindNextFileA(h, &fd));
-
-        FindClose(h);
-    }
-
+    int found = for_each_subdirectory(work, check_package_root, &search);
     int result = 0;
 
     if (!found) {
@@ -655,7 +1218,7 @@ static int install_github(const char *repo,
         else
             printf("Error: repository root must contain library.json.\n");
     } else {
-        result = install_library(source, package_name);
+        result = install_library(search.source, package_name);
     }
 
     remove_directory(work);
@@ -676,7 +1239,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-    if (!init_paths()) {
+    if (!init_paths(argv[0])) {
         printf("Error: cannot determine executable directory.\n");
         return 1;
     }
@@ -710,8 +1273,13 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        /* Report a missing permission with its real reason */
+        if (!ensure_library_directory())
+            return 1;
+
         if (!remove_directory(target)) {
             printf("Error: could not uninstall library.\n");
+            print_os_error();
             return 1;
         }
 
