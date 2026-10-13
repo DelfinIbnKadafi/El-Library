@@ -54,6 +54,10 @@ And elvm will put all  of code in the main code like modules.
 
 Ellib is automaticly including in elvm setup, download in https://github.com/DelfinIbnKadafi/EL-Language
 
+## Publish your library to official repository
+
+Fork this repository first, and make a subfolder in library folder, and make your plugin in that folder. And then create a pull request in here.
+
 ## License
 
 MIT License
