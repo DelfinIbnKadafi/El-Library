@@ -1,0 +1,7 @@
+{
+  "name": "hashing",
+  "description": "Hash functions: djb2, FNV-1a, CRC-32 and SHA-256. A native plugin example.",
+  "version": "1.0.0",
+  "author": "Delfin Ibn Kadafi",
+  "plugins": ["hashing.so", "hashing.dll"]
+}

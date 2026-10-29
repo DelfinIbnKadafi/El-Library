@@ -33,10 +33,18 @@
 #endif
 #endif
 
-#define APP_VERSION "1.2.0"
+#define APP_VERSION "1.3.0"
 #define MAX_FILES 128
 #define MAX_PATH_LEN 4096
 #define MAX_JSON_SIZE (1024 * 1024)
+
+#ifdef _WIN32
+#define PLUGIN_EXTENSION ".dll"
+#elif defined(__APPLE__)
+#define PLUGIN_EXTENSION ".dylib"
+#else
+#define PLUGIN_EXTENSION ".so"
+#endif
 
 #ifdef _WIN32
 #define PATH_SEP '\\'
@@ -55,6 +63,13 @@ typedef struct {
     char name[128];
     char files[MAX_FILES][512];
     int file_count;
+
+    /* Native plugins listed in "plugins". Only the ones for this system are
+       kept in 'plugins' (with the extension added when the entry has none),
+       'plugin_declared' counts every entry of the list. */
+    char plugins[MAX_FILES][512];
+    int plugin_count;
+    int plugin_declared;
 } Library;
 
 static char exe_dir[MAX_PATH_LEN];
@@ -856,6 +871,135 @@ static int safe_relative_file(const char *file)
     return 1;
 }
 
+/* Length of the plugin extension (.dll, .so, .dylib) at the end of a name,
+   or 0 if it has none. 'for_this_system' tells if it is this system's own. */
+static size_t plugin_extension(const char *name, int *for_this_system)
+{
+    static const char *extensions[] = {".dll", ".so", ".dylib"};
+    size_t length = strlen(name);
+
+    for (int i = 0; i < 3; i++) {
+        size_t ext_length = strlen(extensions[i]);
+
+        if (length <= ext_length)
+            continue;
+
+        const char *tail = name + length - ext_length;
+        int same = 1;
+
+        for (size_t j = 0; j < ext_length; j++) {
+            if (tolower((unsigned char)tail[j]) != extensions[i][j]) {
+                same = 0;
+                break;
+            }
+        }
+
+        if (same) {
+            *for_this_system =
+                strcmp(extensions[i], PLUGIN_EXTENSION) == 0;
+            return ext_length;
+        }
+    }
+
+    return 0;
+}
+
+/* Same rule elvm uses for the "plugins" list: an entry with the extension of
+   another system is skipped, an entry with no extension gets this system's
+   one. Returns 1 and the file name in 'out' if the entry is for this system. */
+static int plugin_for_this_system(const char *entry, char *out,
+                                  size_t capacity)
+{
+    int for_this_system = 0;
+    size_t ext_length = plugin_extension(entry, &for_this_system);
+
+    if (ext_length > 0 && !for_this_system)
+        return 0;
+
+    size_t needed = strlen(entry) + (ext_length > 0 ?
+                    0 : strlen(PLUGIN_EXTENSION)) + 1;
+
+    if (needed > capacity)
+        return 0;
+
+    strcpy(out, entry);
+
+    if (ext_length == 0)
+        strcat(out, PLUGIN_EXTENSION);
+
+    return 1;
+}
+
+/* Read the JSON array that starts at 'p' (the value of "key") as a list of
+   relative file paths. Returns 1 if it is fine, or 0 after printing why not. */
+static int read_path_array(const char *key, const char *p,
+                           char (*out)[512], int *count)
+{
+    if (*p++ != '[') {
+        printf("Error: %s must be an array.\n", key);
+        return 0;
+    }
+
+    while (*p) {
+        while (isspace((unsigned char)*p) || *p == ',')
+            p++;
+
+        if (*p == ']')
+            break;
+
+        if (*p++ != '"') {
+            printf("Error: invalid %s array.\n", key);
+            return 0;
+        }
+
+        if (*count >= MAX_FILES) {
+            printf("Error: too many entries in %s.\n", key);
+            return 0;
+        }
+
+        char *dest = out[*count];
+        size_t i = 0;
+
+        while (*p && *p != '"') {
+            if (*p == '\\') {
+                p++;
+                if (*p != '/' && *p != '\\' &&
+                    *p != '"') {
+                    printf("Error: invalid file escape.\n");
+                    return 0;
+                }
+            }
+
+            if (i + 1 >= sizeof(out[0]))
+                return 0;
+
+            dest[i++] = *p++;
+        }
+
+        if (*p != '"')
+            return 0;
+
+        dest[i] = '\0';
+        p++;
+
+        if (!safe_relative_file(dest)) {
+            printf("Error: unsafe file path: %s\n", dest);
+            return 0;
+        }
+
+        /* A library written on Windows may use '\' between folders, store
+           it with '/' so the file also has the right name on Linux */
+        for (char *c = dest; *c; c++) {
+            if (*c == '\\')
+                *c = '/';
+        }
+
+        (*count)++;
+    }
+
+    return 1;
+}
+
 static int read_manifest(const char *path, Library *lib)
 {
     FILE *f = fopen(path, "rb");
@@ -901,88 +1045,53 @@ static int read_manifest(const char *path, Library *lib)
         return 0;
     }
 
-    const char *p = json_value(json, "files");
+    char (*declared)[512] = malloc(sizeof(char[512]) * MAX_FILES);
 
-    if (!p) {
-        printf("Error: missing files array.\n");
+    if (!declared) {
         free(json);
         return 0;
     }
 
-    if (*p++ != '[') {
-        printf("Error: files must be an array.\n");
+    const char *plugins_json = json_value(json, "plugins");
+    int declared_count = 0;
+
+    if (plugins_json &&
+        !read_path_array("plugins", plugins_json, declared,
+                         &declared_count)) {
+        free(declared);
         free(json);
         return 0;
     }
 
-    while (*p) {
-        while (isspace((unsigned char)*p) || *p == ',')
-            p++;
+    lib->plugin_declared = declared_count;
 
-        if (*p == ']')
-            break;
+    for (int i = 0; i < declared_count; i++) {
+        if (plugin_for_this_system(declared[i],
+                                   lib->plugins[lib->plugin_count],
+                                   sizeof(lib->plugins[0])))
+            lib->plugin_count++;
+    }
 
-        if (*p++ != '"') {
-            printf("Error: invalid files array.\n");
+    free(declared);
+
+    /* A library needs files, or plugins (it can be only a plugin) */
+    const char *files_json = json_value(json, "files");
+
+    if (!files_json) {
+        if (declared_count == 0) {
+            printf("Error: missing files array.\n");
             free(json);
             return 0;
         }
-
-        if (lib->file_count >= MAX_FILES) {
-            printf("Error: too many files in manifest.\n");
-            free(json);
-            return 0;
-        }
-
-        char *out = lib->files[lib->file_count];
-        size_t i = 0;
-
-        while (*p && *p != '"') {
-            if (*p == '\\') {
-                p++;
-                if (*p != '/' && *p != '\\' &&
-                    *p != '"') {
-                    printf("Error: invalid file escape.\n");
-                    free(json);
-                    return 0;
-                }
-            }
-
-            if (i + 1 >= sizeof(lib->files[0])) {
-                free(json);
-                return 0;
-            }
-
-            out[i++] = *p++;
-        }
-
-        if (*p != '"') {
-            free(json);
-            return 0;
-        }
-
-        out[i] = '\0';
-        p++;
-
-        if (!safe_relative_file(out)) {
-            printf("Error: unsafe file path: %s\n", out);
-            free(json);
-            return 0;
-        }
-
-        /* A library written on Windows may use '\' between folders, store
-           it with '/' so the file also has the right name on Linux */
-        for (char *c = out; *c; c++) {
-            if (*c == '\\')
-                *c = '/';
-        }
-
-        lib->file_count++;
+    } else if (!read_path_array("files", files_json, lib->files,
+                                &lib->file_count)) {
+        free(json);
+        return 0;
     }
 
     free(json);
 
-    if (lib->file_count == 0) {
+    if (lib->file_count == 0 && declared_count == 0) {
         printf("Error: no files declared in manifest.\n");
         return 0;
     }
@@ -1039,8 +1148,37 @@ static int copy_file(const char *source, const char *target)
     return ok;
 }
 
+/* Plugins are native programs, so say so before installing one. A library
+   from an unofficial repository also needs the user's confirmation. */
+static int confirm_native_plugins(const Library *lib, int ask)
+{
+    printf("Note: library '%s' includes native plugin code:\n", lib->name);
+
+    for (int i = 0; i < lib->plugin_count; i++)
+        printf("  %s\n", lib->plugins[i]);
+
+    puts("A plugin is a program that runs with your permissions.");
+
+    if (!ask)
+        return 1;
+
+    printf("Only install it if you trust the author. Continue? [y/N] ");
+    fflush(stdout);
+
+    char answer[16];
+
+    if (!fgets(answer, sizeof(answer), stdin) ||
+        (answer[0] != 'y' && answer[0] != 'Y')) {
+        puts("Cancelled.");
+        return 0;
+    }
+
+    return 1;
+}
+
 static int install_library(const char *source,
-                           const char *requested_name)
+                           const char *requested_name,
+                           int ask_about_plugins)
 {
     char manifest[MAX_PATH_LEN];
     char target[MAX_PATH_LEN];
@@ -1076,6 +1214,26 @@ static int install_library(const char *source,
         }
     }
 
+    if (lib.plugin_declared > 0 && lib.plugin_count == 0) {
+        printf("Error: library '%s' has no plugin for this system"
+               " (it needs a '%s' file).\n", lib.name, PLUGIN_EXTENSION);
+        return 0;
+    }
+
+    for (int i = 0; i < lib.plugin_count; i++) {
+        char src[MAX_PATH_LEN];
+
+        if (!path_join(src, sizeof(src), source, lib.plugins[i]) ||
+            !path_exists(src)) {
+            printf("Error: missing plugin file: %s\n", lib.plugins[i]);
+            return 0;
+        }
+    }
+
+    if (lib.plugin_count > 0 &&
+        !confirm_native_plugins(&lib, ask_about_plugins))
+        return 0;
+
     if (!make_directory(library_dir)) {
         printf("Error: cannot create library directory.\n");
         print_os_error();
@@ -1107,6 +1265,20 @@ static int install_library(const char *source,
 
         if (!copy_file(src, dst)) {
             printf("Error: failed copying %s\n", lib.files[i]);
+            print_os_error();
+            remove_directory(target);
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < lib.plugin_count; i++) {
+        char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
+
+        path_join(src, sizeof(src), source, lib.plugins[i]);
+        path_join(dst, sizeof(dst), target, lib.plugins[i]);
+
+        if (!copy_file(src, dst)) {
+            printf("Error: failed copying %s\n", lib.plugins[i]);
             print_os_error();
             remove_directory(target);
             return 0;
@@ -1167,7 +1339,8 @@ static int check_package_root(const char *root, void *context)
 }
 
 static int install_github(const char *repo,
-                          const char *package_name)
+                          const char *package_name,
+                          int assume_yes)
 {
     char work[MAX_PATH_LEN], archive[MAX_PATH_LEN];
 
@@ -1218,7 +1391,10 @@ static int install_github(const char *repo,
         else
             printf("Error: repository root must contain library.json.\n");
     } else {
-        result = install_library(search.source, package_name);
+        /* The official repository is reviewed before a library is added,
+           any other repository is not, so ask before installing its plugins */
+        result = install_library(search.source, package_name,
+                                 package_name == NULL && !assume_yes);
     }
 
     remove_directory(work);
@@ -1231,10 +1407,13 @@ static void usage(void)
     puts("");
     puts("Usage:");
     puts("  ellib install <library_name>");
-    puts("  ellib install -g <username/repository_name>");
+    puts("  ellib install -g <username/repository_name> [-y]");
     puts("  ellib uninstall <library_name>");
     puts("  ellib --version");
     puts("  ellib --help");
+    puts("");
+    puts("-y installs the native plugins of an unofficial repository without");
+    puts("asking first.");
 }
 
 int main(int argc, char **argv)
@@ -1287,18 +1466,20 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (argc == 4 &&
+    if ((argc == 4 || argc == 5) &&
         !strcmp(argv[1], "install") &&
         !strcmp(argv[2], "-g") &&
-        valid_repo(argv[3])) {
-        return install_github(argv[3], NULL) ? 0 : 1;
+        valid_repo(argv[3]) &&
+        (argc == 4 || !strcmp(argv[4], "-y") ||
+         !strcmp(argv[4], "--yes"))) {
+        return install_github(argv[3], NULL, argc == 5) ? 0 : 1;
     }
 
     if (argc == 3 &&
         !strcmp(argv[1], "install") &&
         valid_name(argv[2])) {
         return install_github(
-            "DelfinIbnKadafi/El-Library", argv[2]) ? 0 : 1;
+            "DelfinIbnKadafi/El-Library", argv[2], 0) ? 0 : 1;
     }
 
     usage();
