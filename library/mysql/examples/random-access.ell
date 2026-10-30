@@ -1,0 +1,32 @@
+// Read a result by row and column number instead of walking it row by row.
+// Row and column numbers start at 0.
+
+library "mysql";
+
+var int db = mysql_connect("127.0.0.1", "root", "secret", "el_test", 3306);
+
+if(db == NONE) =
+  print format("Cannot connect: %s", mysql_last_error());
+  exit;
+
+var int res = mysql_query(db, "SELECT 1 AS one, 'two' AS two, 3.5 AS three, NULL AS four");
+
+print format("%d row, %d columns", mysql_num_rows(res), mysql_num_fields(res));
+
+var int col = 0;
+
+while(col < mysql_num_fields(res)) =
+  print format("column %d is called %s", col, mysql_field_name(res, col));
+  col++;
+
+print mysql_get_int(res, 0, 0);
+print mysql_get(res, 0, 1);
+print mysql_get_float(res, 0, 2);
+print mysql_get(res, 0, 3);
+
+// mysql_field_index gives the column number of a name (NONE if there is none)
+var int where = mysql_field_index(res, "two");
+print format("'two' is column %d", where);
+
+mysql_free_result(res);
+mysql_close(db);

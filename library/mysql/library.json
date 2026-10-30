@@ -1,0 +1,7 @@
+{
+  "name": "mysql",
+  "description": "MySQL and MariaDB client for El, in the style of the Pawn MySQL plugins. Needs the MySQL or MariaDB client library installed.",
+  "version": "1.0.0",
+  "author": "Delfin Ibn Kadafi",
+  "plugins": ["mysql.dll", "mysql.so"]
+}

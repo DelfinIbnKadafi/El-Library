@@ -1,0 +1,32 @@
+// Never put text from a user straight into SQL. Pass it through mysql_escape
+// first and put the result between single quotes.
+
+library "mysql";
+
+var int db = mysql_connect("127.0.0.1", "root", "secret", "el_test", 3306);
+
+if(db == NONE) =
+  print format("Cannot connect: %s", mysql_last_error());
+  exit;
+
+mysql_exec(db, "CREATE TABLE IF NOT EXISTS el_demo_notes (id INT AUTO_INCREMENT PRIMARY KEY, body VARCHAR(255))");
+mysql_exec(db, "DELETE FROM el_demo_notes");
+
+var str[200] text = input "Write a note: ";
+
+var str[400] safe = mysql_escape(db, text);
+var int added = mysql_exec(db, format("INSERT INTO el_demo_notes (body) VALUES ('%s')", safe));
+
+if(added == NONE) =
+  print format("Could not save the note: %s", mysql_error(db));
+else =
+  print format("Saved note number %d", mysql_insert_id(db));
+
+var int res = mysql_query(db, "SELECT body FROM el_demo_notes");
+
+while(mysql_fetch_row(res)) =
+  print format("Stored: %s", mysql_field(res, "body"));
+
+mysql_free_result(res);
+mysql_exec(db, "DROP TABLE el_demo_notes");
+mysql_close(db);

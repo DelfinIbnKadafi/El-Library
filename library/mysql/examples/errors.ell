@@ -1,0 +1,28 @@
+// How failures show up: a failed connect or query gives NONE, and the reason
+// is read with mysql_last_error (no connection yet) or mysql_error (a connection).
+
+library "mysql";
+
+// 1. A connection that fails (wrong password here)
+var int bad = mysql_connect("127.0.0.1", "root", "wrong password", "el_test", 3306);
+
+if(bad == NONE) =
+  print format("Connect failed (%d): %s", mysql_last_errno(), mysql_last_error());
+
+// 2. A query that fails (a mistake in the SQL)
+var int db = mysql_connect("127.0.0.1", "root", "secret", "el_test", 3306);
+
+if(db == NONE) =
+  print "Cannot connect, stopping";
+  exit;
+
+var int res = mysql_query(db, "SELEKT 1");
+
+if(res == NONE) =
+  print format("Query failed (%d): %s", mysql_errno(db), mysql_error(db));
+
+// 3. Check the connection is still alive
+if(mysql_ping(db)) =
+  print "Connection is alive";
+
+mysql_close(db);

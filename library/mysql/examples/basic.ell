@@ -1,0 +1,41 @@
+// Connect, create a table, insert rows, read them back, update and delete.
+// Change the host, user, password and database to match your server.
+
+library "mysql";
+
+var int db = mysql_connect("127.0.0.1", "root", "secret", "el_test", 3306);
+
+if(db == NONE) =
+  print format("Cannot connect: %s", mysql_last_error());
+  exit;
+
+mysql_exec(db, "CREATE TABLE IF NOT EXISTS el_demo_users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64) NOT NULL, age INT, email VARCHAR(128))");
+mysql_exec(db, "DELETE FROM el_demo_users");
+
+mysql_exec(db, "INSERT INTO el_demo_users (name, age, email) VALUES ('Alice', 30, 'alice@example.com')");
+print format("Inserted Alice with id %d", mysql_insert_id(db));
+
+mysql_exec(db, "INSERT INTO el_demo_users (name, age, email) VALUES ('Bob', 25, NULL)");
+print format("Inserted Bob with id %d", mysql_insert_id(db));
+
+// Read the rows: mysql_fetch_row moves to the next row, mysql_field reads a column
+var int res = mysql_query(db, "SELECT id, name, age, email FROM el_demo_users ORDER BY id");
+
+if(res == NONE) =
+  print format("Query failed: %s", mysql_error(db));
+  mysql_close(db);
+  exit;
+
+print format("%d rows", mysql_num_rows(res));
+
+while(mysql_fetch_row(res)) =
+  print format("%d | %s | %d | %s", mysql_field_int(res, "id"), mysql_field(res, "name"), mysql_field_int(res, "age"), mysql_field(res, "email"));
+
+mysql_free_result(res);
+
+// mysql_exec gives the number of rows a statement changed
+var int changed = mysql_exec(db, "UPDATE el_demo_users SET age = age + 1");
+print format("Updated %d rows", changed);
+
+mysql_exec(db, "DROP TABLE el_demo_users");
+mysql_close(db);
