@@ -1176,13 +1176,33 @@ static int confirm_native_plugins(const Library *lib, int ask)
     return 1;
 }
 
+static int confirm_reinstall(void)
+{
+    char answer[16];
+
+    printf("This library already installed, install it again? (Y/N) : ");
+    fflush(stdout);
+
+    if (!fgets(answer, sizeof(answer), stdin) ||
+        (answer[0] != 'y' && answer[0] != 'Y')) {
+        puts("Cancelled.");
+        return 0;
+    }
+
+    return 1;
+}
+
 static int install_library(const char *source,
                            const char *requested_name,
-                           int ask_about_plugins)
+                           int ask_about_plugins,
+                           int explicit_reinstall)
 {
     char manifest[MAX_PATH_LEN];
     char target[MAX_PATH_LEN];
+    char stage[MAX_PATH_LEN];
+    char backup[MAX_PATH_LEN];
     Library lib;
+    int was_installed;
 
     os_error_text[0] = '\0';
 
@@ -1245,14 +1265,46 @@ static int install_library(const char *source,
         return 0;
     }
 
-    if (is_directory(target)) {
-        printf("Error: library already installed: %s\n", lib.name);
+    was_installed = is_directory(target);
+
+    if (explicit_reinstall && !was_installed) {
+        printf("Error: library not installed: %s\n", lib.name);
         return 0;
     }
 
-    if (!make_directory(target)) {
+    if (was_installed && !explicit_reinstall &&
+        !confirm_reinstall())
+        return 0;
+
+    int found_stage = 0;
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        char stage_name[256];
+        char backup_name[256];
+
+        snprintf(stage_name, sizeof(stage_name),
+                 ".ellib-stage-%s-%d", lib.name, attempt);
+        snprintf(backup_name, sizeof(backup_name),
+                 ".ellib-backup-%s-%d", lib.name, attempt);
+
+        if (!path_join(stage, sizeof(stage), library_dir, stage_name) ||
+            !path_join(backup, sizeof(backup), library_dir, backup_name))
+            return 0;
+
+        if (!path_exists(stage) && !path_exists(backup)) {
+            found_stage = 1;
+            break;
+        }
+    }
+
+    if (!found_stage) {
+        printf("Error: cannot choose a temporary package directory.\n");
+        return 0;
+    }
+
+    if (!make_directory(stage)) {
         printf("Error: cannot create package directory:\n       %s\n",
-               target);
+               stage);
         print_os_error();
         return 0;
     }
@@ -1261,12 +1313,12 @@ static int install_library(const char *source,
         char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
 
         path_join(src, sizeof(src), source, lib.files[i]);
-        path_join(dst, sizeof(dst), target, lib.files[i]);
+        path_join(dst, sizeof(dst), stage, lib.files[i]);
 
         if (!copy_file(src, dst)) {
             printf("Error: failed copying %s\n", lib.files[i]);
             print_os_error();
-            remove_directory(target);
+            remove_directory(stage);
             return 0;
         }
     }
@@ -1275,12 +1327,12 @@ static int install_library(const char *source,
         char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
 
         path_join(src, sizeof(src), source, lib.plugins[i]);
-        path_join(dst, sizeof(dst), target, lib.plugins[i]);
+        path_join(dst, sizeof(dst), stage, lib.plugins[i]);
 
         if (!copy_file(src, dst)) {
             printf("Error: failed copying %s\n", lib.plugins[i]);
             print_os_error();
-            remove_directory(target);
+            remove_directory(stage);
             return 0;
         }
     }
@@ -1288,15 +1340,49 @@ static int install_library(const char *source,
     char dst_manifest[MAX_PATH_LEN];
 
     if (!path_join(dst_manifest, sizeof(dst_manifest),
-                   target, "library.json") ||
+                   stage, "library.json") ||
         !copy_file(manifest, dst_manifest)) {
         printf("Error: failed copying library.json.\n");
         print_os_error();
-        remove_directory(target);
+        remove_directory(stage);
         return 0;
     }
 
-    printf("Installed library '%s' successfully.\n", lib.name);
+    if (was_installed) {
+        if (rename(target, backup) != 0) {
+            save_errno(errno);
+            printf("Error: could not move the existing library:\n       %s\n",
+                   target);
+            print_os_error();
+            remove_directory(stage);
+            return 0;
+        }
+    }
+
+    if (rename(stage, target) != 0) {
+        save_errno(errno);
+        printf("Error: could not activate the new library:\n       %s\n",
+               target);
+        print_os_error();
+        if (was_installed && rename(backup, target) != 0) {
+            save_errno(errno);
+            printf("Error: could not restore the previous library from:\n"
+                   "       %s\n", backup);
+            print_os_error();
+        }
+        remove_directory(stage);
+        return 0;
+    }
+
+    if (was_installed && !remove_directory(backup)) {
+        printf("Error: new library installed, but could not remove backup:\n"
+               "       %s\n", backup);
+        print_os_error();
+        return 0;
+    }
+
+    printf("%s library '%s' successfully.\n",
+           was_installed ? "Reinstalled" : "Installed", lib.name);
     return 1;
 }
 
@@ -1340,7 +1426,8 @@ static int check_package_root(const char *root, void *context)
 
 static int install_github(const char *repo,
                           const char *package_name,
-                          int assume_yes)
+                          int assume_yes,
+                          int explicit_reinstall)
 {
     char work[MAX_PATH_LEN], archive[MAX_PATH_LEN];
 
@@ -1394,7 +1481,8 @@ static int install_github(const char *repo,
         /* The official repository is reviewed before a library is added,
            any other repository is not, so ask before installing its plugins */
         result = install_library(search.source, package_name,
-                                 package_name == NULL && !assume_yes);
+                                 package_name == NULL && !assume_yes,
+                                 explicit_reinstall);
     }
 
     remove_directory(work);
@@ -1408,6 +1496,7 @@ static void usage(void)
     puts("Usage:");
     puts("  ellib install <library_name>");
     puts("  ellib install -g <username/repository_name> [-y]");
+    puts("  ellib reinstall <library_name>");
     puts("  ellib uninstall <library_name>");
     puts("  ellib --version");
     puts("  ellib --help");
@@ -1472,14 +1561,21 @@ int main(int argc, char **argv)
         valid_repo(argv[3]) &&
         (argc == 4 || !strcmp(argv[4], "-y") ||
          !strcmp(argv[4], "--yes"))) {
-        return install_github(argv[3], NULL, argc == 5) ? 0 : 1;
+        return install_github(argv[3], NULL, argc == 5, 0) ? 0 : 1;
     }
 
     if (argc == 3 &&
         !strcmp(argv[1], "install") &&
         valid_name(argv[2])) {
         return install_github(
-            "DelfinIbnKadafi/El-Library", argv[2], 0) ? 0 : 1;
+            "DelfinIbnKadafi/El-Library", argv[2], 0, 0) ? 0 : 1;
+    }
+
+    if (argc == 3 &&
+        !strcmp(argv[1], "reinstall") &&
+        valid_name(argv[2])) {
+        return install_github(
+            "DelfinIbnKadafi/El-Library", argv[2], 0, 1) ? 0 : 1;
     }
 
     usage();

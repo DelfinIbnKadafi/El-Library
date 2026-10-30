@@ -11,6 +11,13 @@ Official packages must be placed at `library/<library_name>/library.json`.
 ellib install lib_name
 ```
 
+If the library is already installed, ellib asks whether to install it again.
+You can also reinstall an installed official library directly:
+
+```bash
+ellib reinstall lib_name
+```
+
 Install from another github repository.
 
 ```bash

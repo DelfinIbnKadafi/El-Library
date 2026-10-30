@@ -1,6 +1,10 @@
 CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -O2
-TARGET = ellib.exe
+ifeq ($(OS),Windows_NT)
+	TARGET = ellib.exe
+else
+    TARGET = ellib
+endif
 SOURCE = ellib.c
 
 .PHONY: all clean
