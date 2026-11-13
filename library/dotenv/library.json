@@ -1,0 +1,7 @@
+{
+  "name": "dotenv",
+  "description": "Load environment variables from a .env file.",
+  "version": "1.0.0",
+  "author": "Delfin Ibn Kadafi",
+  "plugins": ["dotenv.so", "dotenv.dll"]
+}
