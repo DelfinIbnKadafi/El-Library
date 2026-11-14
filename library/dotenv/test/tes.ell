@@ -1,0 +1,6 @@
+library "dotenv";
+
+print env_str("nama");
+print env_int("angka");
+print env_float("tinggi");
+print env_bool("benar");
